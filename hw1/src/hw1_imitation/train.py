@@ -20,7 +20,7 @@ from hw1_imitation.data import (
     load_pusht_zarr,
 )
 from hw1_imitation.model import build_policy, PolicyType
-from hw1_imitation.evaluation import Logger
+from hw1_imitation.evaluation import Logger, evaluate_policy
 
 LOGDIR_PREFIX = "exp"
 
@@ -31,7 +31,7 @@ class TrainConfig:
     data_dir: Path = Path("data")
 
     # The policy type -- either MSE or flow.
-    policy_type: PolicyType = "mse"
+    policy_type: PolicyType = "flow"
     # The number of denoising steps to use for the flow policy (has no effect for the MSE policy).
     flow_num_steps: int = 10
     # The action chunk size.
@@ -127,7 +127,64 @@ def run_training(config: TrainConfig) -> None:
     )
     logger = Logger(log_dir)
 
-    ### TODO: PUT YOUR MAIN TRAINING LOOP HERE ###
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+    )
+
+    step = 0
+    num_batches = len(loader)
+
+    for epoch in range(config.num_epochs):
+        model.train()
+        for batch_idx, (state, action_chunk) in enumerate(loader):
+            state = state.to(device, non_blocking=True)
+            action_chunk = action_chunk.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss = model.compute_loss(state, action_chunk)
+            loss.backward()
+            optimizer.step()
+
+            step += 1
+
+            if step % config.log_interval == 0:
+                epoch_progress = epoch + (batch_idx + 1) / num_batches
+                logger.log(
+                    {
+                        "train/loss": float(loss.item()),
+                        "train/epoch": float(epoch_progress),
+                    },
+                    step=step,
+                )
+
+            if step % config.eval_interval == 0:
+                evaluate_policy(
+                    model=model,
+                    normalizer=normalizer,
+                    device=device,
+                    chunk_size=config.chunk_size,
+                    video_size=config.video_size,
+                    num_video_episodes=config.num_video_episodes,
+                    flow_num_steps=config.flow_num_steps,
+                    step=step,
+                    logger=logger,
+                )
+                model.train()
+
+    if step % config.eval_interval != 0:
+        evaluate_policy(
+            model=model,
+            normalizer=normalizer,
+            device=device,
+            chunk_size=config.chunk_size,
+            video_size=config.video_size,
+            num_video_episodes=config.num_video_episodes,
+            flow_num_steps=config.flow_num_steps,
+            step=step,
+            logger=logger,
+        )
 
     logger.dump_for_grading()
 

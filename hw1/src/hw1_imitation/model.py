@@ -46,13 +46,25 @@ class MSEPolicy(BasePolicy):
         hidden_dims: tuple[int, ...] = (128, 128),
     ) -> None:
         super().__init__(state_dim, action_dim, chunk_size)
+        layers: list[nn.Module] = []
+        in_dim = state_dim
+        for h in hidden_dims:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.ReLU())
+            in_dim = h
+        layers.append(nn.Linear(in_dim, chunk_size * action_dim))
+        self.model = nn.Sequential(*layers)
 
     def compute_loss(
         self,
         state: torch.Tensor,
         action_chunk: torch.Tensor,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        pred_action_chunk = self.model(state).view(
+            state.shape[0], self.chunk_size, self.action_dim
+        )
+        loss = nn.functional.mse_loss(pred_action_chunk, action_chunk)
+        return loss
 
     def sample_actions(
         self,
@@ -60,7 +72,11 @@ class MSEPolicy(BasePolicy):
         *,
         num_steps: int = 10,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        with torch.no_grad():
+            pred_action_chunk = self.model(state).view(
+                state.shape[0], self.chunk_size, self.action_dim
+            )
+        return pred_action_chunk
 
 
 class FlowMatchingPolicy(BasePolicy):
@@ -75,13 +91,46 @@ class FlowMatchingPolicy(BasePolicy):
         hidden_dims: tuple[int, ...] = (128, 128),
     ) -> None:
         super().__init__(state_dim, action_dim, chunk_size)
+        layers: list[nn.Module] = []
+        in_dim = state_dim + chunk_size * action_dim + 1
+        for h in hidden_dims:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.ReLU())
+            in_dim = h
+        layers.append(nn.Linear(in_dim, chunk_size * action_dim))
+        self.model = nn.Sequential(*layers)
 
     def compute_loss(
         self,
         state: torch.Tensor,
         action_chunk: torch.Tensor,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        batch = state.shape[0]
+        device = state.device
+        dtype = state.dtype
+
+        # Sample initial noise A_{t,0} ~ N(0, I)
+        a0 = torch.randn_like(action_chunk)
+
+        # Sample tau ~ Uniform(0,1) for each example and broadcast to chunk shape
+        tau = torch.rand(batch, 1, 1, device=device, dtype=dtype)
+
+        # Interpolate: A_{t,\tau} = tau * A_t + (1 - tau) * A_{t,0}
+        a_tau = tau * action_chunk + (1.0 - tau) * a0
+
+        # Prepare model input: [state, flattened a_tau, tau]
+        a_tau_flat = a_tau.view(batch, -1)
+        tau_flat = tau.view(batch, 1)
+        model_in = torch.cat([state, a_tau_flat, tau_flat], dim=1)
+
+        # Predict velocity v_theta(o_t, A_{t,\tau}, tau)
+        pred_v = self.model(model_in).view(batch, self.chunk_size, self.action_dim)
+
+        # Target velocity is A_t - A_{t,0}
+        target_v = action_chunk - a0
+
+        loss = nn.functional.mse_loss(pred_v, target_v)
+        return loss
 
     def sample_actions(
         self,
@@ -89,7 +138,25 @@ class FlowMatchingPolicy(BasePolicy):
         *,
         num_steps: int = 10,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        with torch.no_grad():
+            batch = state.shape[0]
+            device = state.device
+            dtype = state.dtype
+
+            # Initialize A_{t,0} ~ N(0, I)
+            a = torch.randn(batch, self.chunk_size, self.action_dim, device=device, dtype=dtype)
+
+            # Euler integration from tau=0 to tau=1 in num_steps steps
+            for i in range(num_steps):
+                tau_val = float(i) / float(num_steps)
+                tau = torch.full((batch, 1, 1), tau_val, device=device, dtype=dtype)
+                a_flat = a.view(batch, -1)
+                tau_flat = tau.view(batch, 1)
+                model_in = torch.cat([state, a_flat, tau_flat], dim=1)
+                v = self.model(model_in).view(batch, self.chunk_size, self.action_dim)
+                a = a + (1.0 / float(num_steps)) * v
+
+        return a
 
 
 PolicyType: TypeAlias = Literal["mse", "flow"]
