@@ -59,9 +59,16 @@ class MLPPolicy(nn.Module):
     @torch.no_grad()
     def get_action(self, obs: np.ndarray) -> np.ndarray:
         """Takes a single observation (as a numpy array) and returns a single action (as a numpy array)."""
-        # TODO: implement get_action
-        action = None
+        if obs.ndim == 1:
+            obs = obs[None, ...]
 
+        obs_t = ptu.from_numpy(obs.astype(np.float32))
+        dist = self.forward(obs_t)
+        action_t = dist.sample()
+
+        action = action_t.cpu().numpy()
+        if action.shape[0] == 1:
+            return action[0]
         return action
 
     def forward(self, obs: torch.FloatTensor):
@@ -71,11 +78,12 @@ class MLPPolicy(nn.Module):
         flexible objects, such as a `torch.distributions.Distribution` object. It's up to you!
         """
         if self.discrete:
-            # TODO: define the forward pass for a policy with a discrete action space.
-            pass
+            logits = self.logits_net(obs)
+            return distributions.Categorical(logits=logits)
         else:
-            # TODO: define the forward pass for a policy with a continuous action space.
-            pass
+            mean = self.mean_net(obs)
+            std = torch.exp(self.logstd).unsqueeze(0).expand_as(mean)
+            return distributions.Normal(mean, std)
 
     def update(self, obs: np.ndarray, actions: np.ndarray, *args, **kwargs) -> dict:
         """
@@ -98,13 +106,20 @@ class MLPPolicyPG(MLPPolicy):
         obs = ptu.from_numpy(obs)
         actions = ptu.from_numpy(actions)
         advantages = ptu.from_numpy(advantages)
+        # get distribution from current policy
+        dist = self.forward(obs)
 
-        # TODO: compute the policy gradient actor loss
-        loss = None
+        if self.discrete:
+            log_prob = dist.log_prob(actions.squeeze().long())
+        else:
+            # continuous actions: sum log-probs across action dims
+            log_prob = dist.log_prob(actions).sum(dim=-1)
 
-        # TODO: perform an optimizer step
-        pass
+        # policy gradient loss: negative for gradient ascent on expected return
+        loss = -(log_prob * advantages).mean()
 
-        return {
-            "Actor Loss": loss.item(),
-        }
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return {"Actor Loss": loss.item()}
